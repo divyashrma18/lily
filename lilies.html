@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lily Point-Lines</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden}
+  canvas{position:fixed;inset:0;width:100%;height:100%;display:block}
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<script>
+
+const TAU = Math.PI * 2;
+const cv = document.getElementById('gl');
+const gl = cv.getContext('webgl', { antialias: true, alpha: false, preserveDrawingBuffer: true });
+
+let _s = 20261110;
+function rand() { _s = (_s * 1664525 + 1013904223) >>> 0; return _s / 4294967296; }
+const rnd = (a, b) => a + rand() * (b - a);
+const clamp = (x, a = 0, b = 1) => x < a ? a : x > b ? b : x;
+const smooth = (a, b, x) => { x = clamp((x - a) / (b - a)); return x * x * (3 - 2 * x); };
+const mix3 = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+const norm = v => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / l, v[1] / l, v[2] / l]; };
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const LIGHT = norm([-0.35, 0.55, 0.78]);
+
+const PTS = [], HAIR = [], CONN = [];
+const surfSamples = [];               
+function put(arr, p, c, v, seed, flag) { arr.push(p[0], p[1], p[2], c[0], c[1], c[2], v[0], v[1], v[2], seed, flag); }
+
+function frame(center, axis) {
+  const Z = norm(axis);
+  let X = cross([0, 1, 0], Z); if (Math.hypot(...X) < 1e-3) X = [1, 0, 0]; X = norm(X);
+  const Y = cross(Z, X);
+  return {
+    pt: p => [center[0] + X[0] * p[0] + Y[0] * p[1] + Z[0] * p[2], center[1] + X[1] * p[0] + Y[1] * p[1] + Z[1] * p[2], center[2] + X[2] * p[0] + Y[2] * p[1] + Z[2] * p[2]],
+    dir: p => [X[0] * p[0] + Y[0] * p[1] + Z[0] * p[2], X[1] * p[0] + Y[1] * p[1] + Z[1] * p[2], X[2] * p[0] + Y[2] * p[1] + Z[2] * p[2]],
+  };
+}
+
+function petalSurface(o) {
+  const N = 140, R = new Float32Array(N + 1), Zt = new Float32Array(N + 1), PH = new Float32Array(N + 1);
+  let r = 0.03 * o.L, z = 0;
+  for (let i = 0; i <= N; i++) {
+    const u = i / N, ph = o.phi0 + o.a1 * u + o.a2 * u * u * u;
+    R[i] = r; Zt[i] = z; PH[i] = ph;
+    r += Math.sin(ph) * o.L / N; z += Math.cos(ph) * o.L / N;
+  }
+  const ca = Math.cos(o.az), sa = Math.sin(o.az);
+  const width = u => o.W * Math.pow(Math.sin(Math.PI * Math.pow(clamp(u, 0, 1), 0.78)), 0.72);
+  function pos(u, v) {
+    const uc = clamp(u, 0, 1), f = uc * N, i = Math.min(N - 1, f | 0), t = f - i;
+    const rr = R[i] + (R[i + 1] - R[i]) * t, zz = Zt[i] + (Zt[i + 1] - Zt[i]) * t, ph = PH[i] + (PH[i + 1] - PH[i]) * t;
+    const w = width(uc);
+    const nr = -Math.cos(ph), nz = Math.sin(ph);
+    const tw = o.tw * uc, ct = Math.cos(tw), st = Math.sin(tw);
+    const off = w * (-o.k * v * v
+      + o.ruf * Math.sin(uc * o.fr + o.ph + v * 1.3) * v * v * smooth(0.15, 0.6, uc)
+      + o.ruf * 0.5 * Math.sin(uc * o.fr * 2.3 + o.ph * 2 - v * 2.0) * Math.abs(v) * v * v * uc
+      - 0.10 * Math.exp(-(v * v) / 0.02));
+    const sv = v * w;                      // across
+    const sideAmt = sv * ct - off * st, nAmt = sv * st + off * ct;
+    const rad = rr + nr * nAmt, zloc = zz + nz * nAmt, tang = sideAmt + o.bend * uc * uc * o.L;
+    return [ca * rad - sa * tang, sa * rad + ca * tang, zloc];
+  }
+  function inner(u) { const i = Math.round(clamp(u, 0, 1) * N), ph = PH[i]; return [-Math.cos(ph) * ca, -Math.cos(ph) * sa, Math.sin(ph)]; }
+  return { pos, width, inner };
+}
+
+const C = {
+  crimson: [0.82, 0.07, 0.27], pink: [0.95, 0.33, 0.52], pale: [1.0, 0.86, 0.91], deep: [0.46, 0.01, 0.14],
+  nectar: [0.90, 0.82, 0.22], backPink: [0.80, 0.42, 0.55], backGreen: [0.66, 0.70, 0.34],
+  wiltY: [0.88, 0.76, 0.26], wiltP: [0.74, 0.40, 0.50], leafD: [0.10, 0.26, 0.08], leafL: [0.32, 0.52, 0.18],
+};
+
+function addPetal(fr, o, mode, nPts, nHair) {
+  const S = petalSurface(o);
+  const spots = [];
+  if (mode !== 'leaf') for (let i = 0; i < (mode === 'lily' ? 110 : 40); i++)
+    spots.push([0.07 + 0.62 * Math.pow(rand(), 1.25), rnd(-0.8, 0.8), rnd(0.004, 0.011) * o.L]);
+  for (let i = 0; i < nPts; i++) {
+    const u = Math.pow(rand(), 0.85), v = rnd(-1, 1), av = Math.abs(v);
+    const P = S.pos(u, v), e = 0.004;
+    const Pu = S.pos(u + e, v), Pv = S.pos(u, v + e);
+    let nl = norm(cross([Pu[0] - P[0], Pu[1] - P[1], Pu[2] - P[2]], [Pv[0] - P[0], Pv[1] - P[1], Pv[2] - P[2]]));
+    const ni = S.inner(u); if (nl[0] * ni[0] + nl[1] * ni[1] + nl[2] * ni[2] < 0) nl = [-nl[0], -nl[1], -nl[2]];
+    let n = fr.dir(nl);
+    const W = fr.pt(P);
+    let front = n[2] > 0; if (!front) n = [-n[0], -n[1], -n[2]];
+    let c;
+    if (mode === 'leaf') {
+      c = mix3(C.leafD, C.leafL, 0.25 + 0.5 * rand() * u); if (av < 0.06) c = mix3(c, C.leafL, 0.6);
+    } else if (mode === 'wilt') {
+      c = mix3(C.wiltY, C.wiltP, smooth(0.25, 0.9, av) * 0.8 + 0.15 * Math.sin(u * 9 + v * 3));
+      c = mix3(c, C.pale, smooth(0.86, 1, av) * 0.8);
+    } else if (front) {
+      c = mix3(C.crimson, C.pink, smooth(0.3, 0.85, av));
+      if (av < 0.12 && u > 0.25) c = mix3(c, C.deep, 0.35 * (1 - av / 0.12));
+      c = mix3(c, C.pale, Math.max(smooth(0.8, 1.0, av), smooth(0.86, 1, u) * 0.6));
+      const nect = (1 - smooth(0.12, 0.5, u)) * (1 - smooth(0.08, 0.3 + 0.2 * (1 - u), av));
+      c = mix3(c, C.nectar, nect);
+    } else {
+      c = mix3(C.backPink, C.backGreen, (1 - smooth(0.0, 0.35, av)) * 0.75);
+      c = mix3(c, C.pale, smooth(0.8, 1, av) * 0.7);
+    }
+    if (mode !== 'leaf' && (front || mode === 'wilt')) {
+      const w = S.width(u);
+      for (let s = 0; s < spots.length; s++) {
+        const sp = spots[s], du = (u - sp[0]) * o.L, dv = (v - sp[1]) * w;
+        if (du * du * 0.5 + dv * dv < sp[2] * sp[2]) { c = mix3(c, C.deep, mode === 'lily' ? 0.9 : 0.5); break; }
+      }
+    }
+    const diff = Math.max(0, n[0] * LIGHT[0] + n[1] * LIGHT[1] + n[2] * LIGHT[2]);
+    let sh = (0.36 + 0.8 * diff) * (0.55 + 0.45 * smooth(0, 0.3, u)) * (0.84 + 0.3 * rand());
+    if (rand() < 0.04) sh *= 1.5;                     // sparkle grains
+    c = [Math.min(1, c[0] * sh), Math.min(1, c[1] * sh), Math.min(1, c[2] * sh)];
+    put(PTS, W, c, [0, 0, 0], rand(), 0);
+    if (i % 14 === 0) surfSamples.push(W);
+  }
+  for (let i = 0; i < nHair; i++) {
+    const u = 0.06 + 0.94 * Math.pow(rand(), 0.8), v = rand() < 0.5 ? -1 : 1;
+    const P = S.pos(u, v), Q = S.pos(Math.min(1.02, u + 0.03 * rnd(-1, 2)), v * 1.3);
+    let d = norm([Q[0] - P[0], Q[1] - P[1], Q[2] - P[2]]);
+    d = norm([d[0] + rnd(-.45, .45), d[1] + rnd(-.45, .45), d[2] + rnd(-.45, .45)]);
+    const len = o.L * rnd(0.025, 0.075) * (rand() < 0.08 ? 2.2 : 1) * (mode === 'leaf' ? 0.6 : 1);
+    const W = fr.pt(P), V = fr.dir(d).map(x => x * len);
+    const base = mode === 'leaf' ? [0.45, 0.6, 0.3] : mode === 'wilt' ? [0.95, 0.88, 0.6] : [0.97, 0.8, 0.86];
+    const tip = mode === 'leaf' ? [0.7, 0.8, 0.55] : [1, 0.95, 0.96];
+    const seed = rand();
+    put(HAIR, W, base, V, seed, 0); put(HAIR, W, tip, V, seed, 1);
+  }
+}
+
+function petalOpts(L, az, inner, droop) {
+  return {
+    L: L * rnd(0.9, 1.06), W: L * (inner ? rnd(0.2, 0.235) : rnd(0.15, 0.18)), az,
+    phi0: droop ? rnd(0.05, 0.25) : rnd(0.7, 0.9),
+    a1: droop ? rnd(0.3, 0.7) : rnd(0.9, 1.25),
+    a2: droop ? rnd(0.2, 1.2) : rnd(1.2, 2.3),
+    tw: rnd(-1.0, 1.0), bend: rnd(-0.18, 0.18), k: rnd(0.22, 0.4),
+    ruf: rnd(0.16, 0.3), fr: rnd(16, 26), ph: rnd(0, TAU),
+  };
+}
+
+function addStamens(fr, L) {
+  const base = rnd(0, TAU);
+  for (let i = 0; i < 7; i++) {
+    const pist = i === 6, a = pist ? rnd(0, TAU) : base + i * TAU / 6 + rnd(-.25, .25);
+    const len = L * (pist ? 0.78 : rnd(0.55, 0.68)), spread = pist ? 0.12 : rnd(0.28, 0.42);
+    const ca = Math.cos(a), sa = Math.sin(a);
+    const at = t => { const r = spread * len * t * t, z = len * t * (1 - 0.15 * t); return [ca * r, sa * r, z]; };
+    for (let k = 0; k < 520; k++) {
+      const t = rand(), p = at(t), j = 0.007 * L;
+      const c = pist ? [0.72, 0.8, 0.42] : mix3([0.80, 0.86, 0.36], [0.97, 0.80, 0.2], t);
+      const sh = rnd(0.7, 1.15);
+      put(PTS, fr.pt([p[0] + rnd(-j, j), p[1] + rnd(-j, j), p[2] + rnd(-j, j)]), c.map(x => Math.min(1, x * sh)), [0, 0, 0], rand(), 0);
+    }
+    const tip = at(1), t0 = at(0.96), ax = norm([tip[0] - t0[0], tip[1] - t0[1], tip[2] - t0[2]]);
+    const side = norm(cross(ax, [ca, sa, 0.3]));
+    for (let k = 0; k < (pist ? 160 : 420); k++) {     // anther / stigma
+      const s = rnd(-1, 1), th = rnd(0, TAU), rr = (pist ? 0.022 : 0.02) * L * Math.sqrt(1 - s * s);
+      const along = pist ? ax : side, o2 = cross(along, pist ? side : ax), hl = (pist ? 0.02 : 0.075) * L;
+      const p = [0, 1, 2].map(q => tip[q] + along[q] * s * hl + (o2[q] * Math.cos(th) + (pist ? side[q] : ax[q]) * Math.sin(th)) * rr);
+      const c = pist ? [0.45, 0.5, 0.22] : mix3([0.55, 0.2, 0.05], [0.9, 0.5, 0.15], rand());
+      put(PTS, fr.pt(p), c, [0, 0, 0], rand(), 0);
+    }
+  }
+}
+
+function addLily(center, axis, L, opts = {}) {
+  const fr = frame(center, axis), base = rnd(0, TAU), droop = !!opts.wilt;
+  const n = opts.n || 15000;
+  for (let k = 0; k < 2; k++) for (let i = 0; i < 3; i++) {
+    const az = base + i * TAU / 3 + (k ? TAU / 6 : 0) + rnd(-.12, .12);
+    addPetal(fr, petalOpts(L, az, k === 1, droop), droop ? 'wilt' : 'lily', k ? n : n * 0.8 | 0, droop ? 400 : 700);
+  }
+  if (!droop) addStamens(fr, L);
+}
+
+function addLeaf(origin, axis, az, L) {
+  const fr = frame(origin, axis);
+  addPetal(fr, { L, W: L * 0.13, az, phi0: rnd(0.9, 1.3), a1: rnd(0.2, 0.6), a2: rnd(0, 0.5), tw: rnd(-.5, .5), bend: rnd(-.1, .1), k: 0.5, ruf: 0.05, fr: 9, ph: rnd(0, TAU) }, 'leaf', 6500, 160);
+}
+
+function addBud(center, axis, L) {
+  const fr = frame(center, axis);
+  for (let i = 0; i < 9000; i++) {
+    const s = rand(), th = rnd(0, TAU), rib = Math.cos(3 * th);
+    const rad = 0.17 * L * Math.pow(Math.sin(Math.PI * Math.pow(s, 0.72)), 0.8) * (1 + 0.1 * rib);
+    const p = fr.pt([rad * Math.cos(th), rad * Math.sin(th), s * L]);
+    let n = fr.dir(norm([Math.cos(th), Math.sin(th), 0.25 - s * 0.5])); if (n[2] < 0) n = n.map(x => -x);
+    let c = mix3([0.28, 0.46, 0.14], [0.88, 0.84, 0.3], smooth(0.05, 0.55, s));
+    if (rib < -0.75) c = mix3(c, [0.3, 0.4, 0.1], 0.6);
+    const sh = (0.3 + 0.8 * Math.max(0, n[0] * LIGHT[0] + n[1] * LIGHT[1] + n[2] * LIGHT[2])) * rnd(0.85, 1.15);
+    put(PTS, p, c.map(x => Math.min(1, x * sh)), [0, 0, 0], rand(), 0);
+    if (i % 14 === 0) surfSamples.push(p);
+    if (i % 22 === 0) {
+      const d = fr.dir(norm([Math.cos(th) + rnd(-.4, .4), Math.sin(th) + rnd(-.4, .4), rnd(-.3, .5)])).map(x => x * L * rnd(0.02, 0.05));
+      const seed = rand(); put(HAIR, p, [0.9, 0.88, 0.5], d, seed, 0); put(HAIR, p, [1, 1, 0.85], d, seed, 1);
+    }
+  }
+}
+
+function addStem(a, ctrl, b, rad) {
+  for (let i = 0; i < 4200; i++) {
+    const t = rand(), m = 1 - t, th = rnd(0, TAU);
+    const c = [0, 1, 2].map(q => m * m * a[q] + 2 * m * t * ctrl[q] + t * t * b[q]);
+    const n = [Math.cos(th), 0, Math.sin(th)];
+    const p = [c[0] + n[0] * rad, c[1], c[2] + n[2] * rad];
+    const sh = (0.25 + 0.75 * Math.max(0, n[0] * LIGHT[0] + Math.abs(n[2]) * LIGHT[2])) * rnd(0.8, 1.15);
+    put(PTS, p, [0.22 * sh, 0.42 * sh, 0.13 * sh], [0, 0, 0], rand(), 0);
+    if (i % 40 === 0) surfSamples.push(p);
+  }
+}
+
+function buildScene() {
+  const root = [0.12, -2.5, -0.35];
+  const F = [
+    { c: [-0.52, 0.80, 0.00], a: [-0.72, 0.28, 0.63], L: 1.15 },
+    { c: [0.52, 0.18, 0.28], a: [0.30, 0.02, 0.95], L: 1.2 },
+    { c: [-0.60, -0.85, 0.12], a: [-0.42, -0.5, 0.75], L: 1.18 },
+  ];
+  const wilt = { c: [0.78, -0.8, -0.1], a: [0.22, -0.95, 0.2], L: 0.95 };
+  const bud = { c: [0.34, 1.2, -0.3], a: [0.25, 0.95, 0.15], L: 0.72 };
+  for (const f of [...F, wilt, bud]) {
+    const ax = norm(f.a), back = [f.c[0] - ax[0] * 0.7, f.c[1] - ax[1] * 0.7 - 0.3, f.c[2] - ax[2] * 0.7];
+    addStem(f.c, back, root, 0.032);
+  }
+  addLeaf([0.05, 0.75, -0.3], [0.2, 0.9, 0.3], 0.3, 0.9);
+  addLeaf([0.1, -0.2, -0.3], [-0.1, 0.9, 0.3], 2.6, 0.85);
+  addLeaf([0.2, -0.5, -0.35], [0.5, 0.7, 0.3], 0.0, 0.95);
+  addLeaf([0.1, -1.4, -0.3], [-0.5, 0.6, 0.4], 3.3, 0.8);
+  addLeaf([0.55, 0.9, -0.4], [0.6, 0.6, 0.2], 0.4, 0.7);
+  addBud(bud.c, bud.a, bud.L);
+  addLily(wilt.c, wilt.a, wilt.L, { wilt: true, n: 9000 });
+  for (const f of F) addLily(f.c, f.a, f.L);
+
+  const bins = new Map(), bh = 0.022;
+  surfSamples.forEach((p, i) => { const k = Math.floor(p[1] / bh); if (!bins.has(k)) bins.set(k, []); bins.get(k).push(i); });
+  let made = 0, guard = 0;
+  while (made < 6000 && guard++ < 200000) {
+    const a = surfSamples[rand() * surfSamples.length | 0];
+    const row = bins.get(Math.floor(a[1] / bh) + (rand() * 3 | 0) - 1); if (!row) continue;
+    const b = surfSamples[row[rand() * row.length | 0]], dx = Math.abs(a[0] - b[0]);
+    if (dx < 0.25 || dx > 1.3) continue;
+    const z = Math.min(a[2], b[2]) - rnd(0.2, 0.5), g = rnd(0.3, 0.9);
+    const col = [g, g * 0.95, g * 0.93];
+    put(CONN, [a[0], a[1], z], col, [0, 0, 0], rand(), 0);
+    put(CONN, [b[0], b[1], z], col, [0, 0, 0], rand(), 0);
+    made++;
+  }
+}
+buildScene();
+
+const VS = `
+attribute vec3 aPos, aCol, aVec; attribute vec2 aSF;
+uniform mat3 uR; uniform float uT, uF, uAsp, uPs, uAlpha, uBias, uHair;
+varying vec4 vC;
+vec3 flow(vec3 p, float t){
+  return vec3(
+    sin(p.y*1.9 + t*0.55) + 0.6*sin(p.z*3.1 + p.x*1.3 + t*0.37),
+    sin(p.x*2.2 + t*0.47 + 1.7) + 0.6*sin(p.z*2.7 - t*0.41 + p.y*0.9),
+    sin(p.x*2.9 + p.y*1.1 + t*0.43) + 0.6*sin(p.y*2.5 - t*0.52));
+}
+void main(){
+  float s = aSF.x, tip = aSF.y;
+  vec3 p = aPos;
+  p += 0.045 * flow(p, uT);                                   // slow breathing wobble
+  p += 0.012 * flow(p*3.7 + 4.0, uT*1.9);                     // finer ripple over the surface
+  p += 0.0035 * vec3(sin(uT*2.3 + s*90.0), cos(uT*2.9 + s*70.0), sin(uT*1.7 + s*50.0));  // grain shimmer
+  vec3 hv = aVec * uHair * (0.7 + 0.5*sin(uT*1.4 + s*40.0));
+  hv += length(aVec) * 0.4 * vec3(sin(uT*2.1 + s*61.0), cos(uT*1.7 + s*47.0), sin(uT*1.3 + s*29.0));
+  p += tip * hv;
+  vec3 q = uR * p;
+  float w = 6.0 - q.z;
+  gl_Position = vec4(q.x*uF/uAsp, (q.y + 0.22)*uF, (-q.z*0.15 - uBias)*w, w);
+  gl_PointSize = uPs * 6.0 / w;
+  vC = vec4(aCol, uAlpha * (1.0 - 0.45*tip));
+}`;
+const FS = `precision mediump float; varying vec4 vC; void main(){ gl_FragColor = vC; }`;
+function sh(type, src) { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
+const prog = gl.createProgram();
+gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog); gl.useProgram(prog);
+const loc = {}; for (const n of ['aPos', 'aCol', 'aVec', 'aSF']) loc[n] = gl.getAttribLocation(prog, n);
+const U = {}; for (const n of ['uR', 'uT', 'uF', 'uAsp', 'uPs', 'uAlpha', 'uBias', 'uHair']) U[n] = gl.getUniformLocation(prog, n);
+
+function buf(arr) { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(arr), gl.STATIC_DRAW); return { b, n: arr.length / 11 }; }
+const B = { pts: buf(PTS), hair: buf(HAIR), conn: buf(CONN) };
+function bind(o) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, o.b); const S = 44;
+  gl.enableVertexAttribArray(loc.aPos); gl.vertexAttribPointer(loc.aPos, 3, gl.FLOAT, false, S, 0);
+  gl.enableVertexAttribArray(loc.aCol); gl.vertexAttribPointer(loc.aCol, 3, gl.FLOAT, false, S, 12);
+  gl.enableVertexAttribArray(loc.aVec); gl.vertexAttribPointer(loc.aVec, 3, gl.FLOAT, false, S, 24);
+  gl.enableVertexAttribArray(loc.aSF); gl.vertexAttribPointer(loc.aSF, 2, gl.FLOAT, false, S, 36);
+}
+
+let W, H, DPR;
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight; cv.width = W * DPR; cv.height = H * DPR;
+  gl.viewport(0, 0, cv.width, cv.height);
+}
+addEventListener('resize', resize); resize();
+
+const mouse = { x: 0, y: 0, tx: 0, ty: 0 };
+addEventListener('pointermove', e => { mouse.tx = e.clientX / W * 2 - 1; mouse.ty = e.clientY / H * 2 - 1; });
+let paused = false, t = 0, last = performance.now();
+addEventListener('keydown', e => { if (e.key === ' ') { paused = !paused; e.preventDefault(); } });
+
+function frameLoop(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now; if (!paused) t += dt;
+  mouse.x += (mouse.tx - mouse.x) * 0.05; mouse.y += (mouse.ty - mouse.y) * 0.05;
+  const ay = Math.sin(t * 0.23) * 0.10 + mouse.x * 0.28, ax = Math.sin(t * 0.17 + 1) * 0.04 + mouse.y * 0.16;
+  const cy = Math.cos(ay), sy = Math.sin(ay), cx = Math.cos(ax), sx = Math.sin(ax);
+  // R = Rx * Ry  (column-major)
+  const R = [cy, sx * sy, -cx * sy, 0, cx, sx, sy, -sx * cy, cx * cy];
+  const asp = cv.width / cv.height;
+  gl.depthMask(true);   // must be on, or the depth buffer is never cleared
+  gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL);
+  gl.uniformMatrix3fv(U.uR, false, R);
+  gl.uniform1f(U.uT, t); gl.uniform1f(U.uAsp, asp);
+  gl.uniform1f(U.uF, Math.min(6 / 2.0, 6 * asp / 1.8));
+  gl.uniform1f(U.uPs, Math.max(1.6, Math.min(cv.height, cv.width * 1.2) / 900 * 2.5));
+  gl.uniform1f(U.uHair, 1.0 + 0.45 * Math.sin(t * 0.55));
+
+  gl.disable(gl.BLEND); gl.depthMask(true);
+  gl.uniform1f(U.uAlpha, 1); gl.uniform1f(U.uBias, 0);
+  bind(B.pts); gl.drawArrays(gl.POINTS, 0, B.pts.n);
+
+  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
+  gl.uniform1f(U.uAlpha, 0.2);
+  bind(B.conn); gl.drawArrays(gl.LINES, 0, B.conn.n);
+  gl.uniform1f(U.uAlpha, 0.7); gl.uniform1f(U.uBias, 0.004);
+  bind(B.hair); gl.drawArrays(gl.LINES, 0, B.hair.n);
+  requestAnimationFrame(frameLoop);
+}
+requestAnimationFrame(frameLoop);
+</script>
+</body>
+</html>
